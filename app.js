@@ -1,10 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const decoder = new TextDecoder();
-const state = {key:null, notes:[], media:new Map(), urls:new Set(), session:0, currentId:null, ascending:false, calendar:'', lastActive:Date.now(), filter:{q:'',tag:'',topic:'',month:'',day:'',images:false}};
+const state = {key:null, notes:[], media:new Map(), urls:new Set(), session:0, unlockAttempt:0, unlocking:false, currentId:null, ascending:false, calendar:'', lastActive:Date.now(), filter:{q:'',tag:'',topic:'',month:'',day:'',images:false}};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
 function button(text, cls, action) {const el=node('button',text,cls);el.type='button';el.addEventListener('click',action);return el;}
-function b64(value) {return Uint8Array.from(atob(value),c=>c.charCodeAt(0));}
 function monthLabel(value) {return `${value.slice(0,4)} 年 ${Number(value.slice(5,7))} 月`;}
 function dateLabel(note) {return note.date.replace(/^(\d{4})-(\d{2})-(\d{2}).*/,(_,y,m,d)=>`${y} 年 ${Number(m)} 月 ${Number(d)} 日`);}
 function toast(message) {$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,4500);}
@@ -12,22 +10,23 @@ function resetFilters() {state.filter={q:'',tag:'',topic:'',month:'',day:'',imag
 
 async function unlock(event) {
   event.preventDefault();
+  if(state.unlocking)return;
   const password=$('password').value;
+  const attempt=++state.unlockAttempt,session=state.session;
+  const isCurrent=()=>attempt===state.unlockAttempt&&session===state.session;
+  state.unlocking=true;
   const submit=$('unlock-submit');submit.disabled=true;submit.textContent='正在打开…';
   $('unlock-message').classList.remove('error');$('unlock-message').textContent='正在解锁这本随记…';
   try {
     if(!window.crypto?.subtle) throw new Error('此浏览器需要通过 HTTPS 打开网页。');
-    const response=await fetch('journal.enc.json',{cache:'no-store'});
-    if(!response.ok) throw new Error('暂时无法读取随记，请稍后重试。');
-    const data=await response.json();
-    if(data.version!==1||data.iterations!==600000) throw new Error('暂不支持这个随记文件版本。');
-    const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveKey']);
-    const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64(data.salt),iterations:data.iterations,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
-    let plain;
-    try {plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64(data.nonce),additionalData:new TextEncoder().encode('journal:v1')},key,b64(data.ciphertext));}
-    catch {throw new Error('密码不对，或文件未完整加载。请检查后再试。');}
-    const payload=JSON.parse(decoder.decode(plain));
-    if(!Array.isArray(payload.notes)) throw new Error('随记文件格式有误。');
+    const responses=await Promise.all([fetch('journal.enc.json',{cache:'no-store'}),fetch('view-password-wrap.json',{cache:'no-store'})]);
+    if(!isCurrent())throw new Error('解锁已取消');
+    if(responses.some(response=>!response.ok))throw new Error('暂时无法读取随记资料，请刷新网页后重试。');
+    const [data,passwordWrap]=await Promise.all(responses.map(response=>response.json()));
+    if(!isCurrent())throw new Error('解锁已取消');
+    if(!window.JournalPasswordCrypto)throw new Error('网页解锁组件未加载，请刷新网页后重试。');
+    const {key,payload}=await window.JournalPasswordCrypto.decryptJournal(password,data,passwordWrap,{isCurrent});
+    if(!isCurrent())throw new Error('解锁已取消');
     state.key=key;state.notes=payload.notes;state.session++;state.lastActive=Date.now();
     state.calendar=state.notes.length?state.notes.map(n=>n.date.slice(0,7)).sort().at(-1):new Date().toISOString().slice(0,7);
     $('password').value='';$('password').type='password';$('show-password').textContent='显示';
@@ -37,11 +36,12 @@ async function unlock(event) {
     populate();resetFilters();
     if(location.hash.startsWith('#card-')) openNote(location.hash.slice(1));
     window.scrollTo(0,0);
-  } catch(error) {$('unlock-message').textContent=error.message||'打开失败，请重试。';$('unlock-message').classList.add('error');}
-  finally {submit.disabled=false;submit.replaceChildren(document.createTextNode('打开我的随记 '),node('span','↗'));}
+  } catch(error) {if(attempt===state.unlockAttempt){$('unlock-message').textContent=error.message||'打开失败，请重试。';$('unlock-message').classList.add('error');}}
+  finally {if(attempt===state.unlockAttempt){state.unlocking=false;$('password').value='';submit.disabled=false;submit.replaceChildren(document.createTextNode('打开我的随记 '),node('span','↗'));}}
 }
 
 function lockJournal() {
+  state.unlockAttempt++;state.unlocking=false;$('unlock-submit').disabled=false;$('unlock-submit').replaceChildren(document.createTextNode('打开我的随记 '),node('span','↗'));
   state.session++;state.key=null;state.notes=[];state.currentId=null;state.media.clear();
   state.urls.forEach(url=>URL.revokeObjectURL(url));state.urls.clear();
   ['reader','lightbox'].forEach(id=>$(id).close());
